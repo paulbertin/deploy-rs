@@ -20,6 +20,11 @@ pub fn make_lock_path(temp_path: &Path, closure: &str) -> PathBuf {
     temp_path.join(format!("deploy-rs-canary-{}", lock_hash))
 }
 
+pub fn make_cancel_path(temp_path: &Path, closure: &str) -> PathBuf {
+    let lock_hash = &closure["/nix/store/".len()..closure.find('-').unwrap_or(closure.len())];
+    temp_path.join(format!("deploy-rs-cancel-{}", lock_hash))
+}
+
 const fn make_emoji(level: log::Level) -> &'static str {
     match level {
         log::Level::Error => "❌",

@@ -255,6 +255,12 @@ pub enum ActivationConfirmationError {
     WaitingError(#[from] DangerZoneError),
 }
 
+#[derive(Debug)]
+pub enum WaitEvent {
+    Confirmed,
+    Cancelled,
+}
+
 #[derive(Error, Debug)]
 pub enum DangerZoneError {
     #[error("Timeout elapsed for confirmation")]
@@ -263,16 +269,19 @@ pub enum DangerZoneError {
     NoConfirmation,
     #[error("inotify encountered an error: {0}")]
     Watch(notify::Error),
+    #[error("Activation cancelled by deployment client")]
+    Cancelled,
 }
 
 async fn danger_zone(
-    mut events: mpsc::Receiver<Result<(), notify::Error>>,
+    mut events: mpsc::Receiver<Result<WaitEvent, notify::Error>>,
     confirm_timeout: u16,
 ) -> Result<(), DangerZoneError> {
     info!("Waiting for confirmation event...");
 
     match timeout(Duration::from_secs(confirm_timeout as u64), events.recv()).await {
-        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Ok(WaitEvent::Confirmed))) => Ok(()),
+        Ok(Some(Ok(WaitEvent::Cancelled))) => Err(DangerZoneError::Cancelled),
         Ok(Some(Err(e))) => Err(DangerZoneError::Watch(e)),
         Ok(None) => Err(DangerZoneError::NoConfirmation),
         Err(_) => Err(DangerZoneError::TimesUp),
@@ -285,7 +294,7 @@ fn confirmation_watcher(
 ) -> Result<
     (
         RecommendedWatcher,
-        mpsc::Receiver<Result<(), notify::Error>>,
+        mpsc::Receiver<Result<WaitEvent, notify::Error>>,
     ),
     notify::Error,
 > {
@@ -300,7 +309,7 @@ fn confirmation_watcher(
                         && e.paths.iter().any(|path| path == &lock_path) =>
                 {
                     debug!("Got canary removal event, sending on channel");
-                    deleted.try_send(Ok(()))
+                    deleted.try_send(Ok(WaitEvent::Confirmed))
                 }
                 Err(e) => {
                     debug!("Got error waiting for removal event, sending on channel");
@@ -317,6 +326,28 @@ fn confirmation_watcher(
     watcher.watch(temp_path, RecursiveMode::NonRecursive)?;
 
     Ok((watcher, done))
+}
+
+async fn create_activation_cancel(temp_path: &Path, closure: &str) {
+    let cancel_path = deploy::make_cancel_path(temp_path, closure);
+
+    debug!("Creating cancel file to signal wait process");
+
+    if let Some(parent) = cancel_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent).await {
+            debug!("Failed to create parent directory for cancel file: {}", e);
+            return;
+        }
+    }
+
+    if let Err(e) = fs::File::create(&cancel_path).await {
+        debug!("Failed to create cancel file: {}", e);
+    } else {
+        debug!(
+            "Cancel file created successfully at {}",
+            cancel_path.display()
+        );
+    }
 }
 
 pub async fn activation_confirmation(
@@ -398,12 +429,21 @@ pub async fn wait(
     activation_timeout: Option<u16>,
 ) -> Result<(), WaitError> {
     let lock_path = deploy::make_lock_path(&temp_path, &closure);
+    let cancel_path = deploy::make_cancel_path(&temp_path, &closure);
+
+    // Clean up any stale cancel file from a previous failed deployment.
+    // This prevents false positives when retrying the same closure.
+    if fs::metadata(&cancel_path).await.is_ok() {
+        debug!("Removing stale cancel file from previous deployment");
+        let _ = fs::remove_file(&cancel_path).await;
+    }
 
     let (created, done) = mpsc::channel(1);
 
     let mut watcher: RecommendedWatcher = {
         // TODO: fix wasteful clone
         let lock_path = lock_path.clone();
+        let cancel_path = cancel_path.clone();
 
         recommended_watcher(move |res: Result<notify::event::Event, notify::Error>| {
             let send_result = match res {
@@ -412,8 +452,15 @@ pub async fn wait(
                         [x] => match lock_path.canonicalize() {
                             // 'lock_path' may not exist yet when some other files are created in 'temp_path'
                             // x is already supposed to be canonical path
-                            Ok(lock_path) if x == &lock_path => created.try_send(Ok(())),
-                            _ => Ok(()),
+                            Ok(lock_path) if x == &lock_path => {
+                                created.try_send(Ok(WaitEvent::Confirmed))
+                            }
+                            _ => match cancel_path.canonicalize() {
+                                Ok(cancel_path) if x == &cancel_path => {
+                                    created.try_send(Ok(WaitEvent::Cancelled))
+                                }
+                                _ => Ok(()),
+                            },
                         },
                         _ => Ok(()),
                     }
@@ -434,6 +481,10 @@ pub async fn wait(
     if fs::metadata(&lock_path).await.is_ok() {
         watcher.unwatch(&temp_path)?;
         return Ok(());
+    }
+    if fs::metadata(&cancel_path).await.is_ok() {
+        watcher.unwatch(&temp_path)?;
+        return Err(DangerZoneError::Cancelled.into());
     }
 
     danger_zone(done, activation_timeout.unwrap_or(240)).await?;
@@ -503,6 +554,9 @@ pub async fn activate(
         match nix_env_set_exit_status.code() {
             Some(0) => (),
             _exit_code => {
+                if magic_rollback && !boot && !dry_activate {
+                    create_activation_cancel(&temp_path, &closure).await;
+                }
                 if auto_rollback && !dry_activate {
                     deactivate(&profile_path).await?;
                 }
@@ -538,6 +592,9 @@ pub async fn activate(
     {
         Ok(x) => x,
         Err(e) => {
+            if magic_rollback && !boot && !dry_activate {
+                create_activation_cancel(&temp_path, &closure).await;
+            }
             if auto_rollback && !dry_activate {
                 deactivate(&profile_path).await?;
             }
@@ -549,6 +606,9 @@ pub async fn activate(
         match activate_status.code() {
             Some(0) => (),
             _exit_code => {
+                if magic_rollback && !boot {
+                    create_activation_cancel(&temp_path, &closure).await;
+                }
                 if auto_rollback {
                     deactivate(&profile_path).await?;
                 }
