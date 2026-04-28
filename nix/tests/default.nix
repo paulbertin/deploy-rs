@@ -20,7 +20,9 @@ let
     done <$refs
   '';
 
-  mkTest = { name ? "", user ? "root", flakes ? true, isLocal ? true, deployArgs }: let
+  mkTest = { name ? "", user ? "root", flakes ? true, isLocal ? true, deployArgs
+           , expectCancellationWithin ? null
+           }: let
     nodes = {
       server = { nodes, ... }: {
         imports = [
@@ -112,6 +114,15 @@ let
         timeout=30
       )
 
+      ${if expectCancellationWithin != null then ''
+      # Activation is expected to fail. Assert the wait process is cancelled
+      # rather than blocking until activation_timeout, so deploy returns quickly.
+      import time
+      start = time.time()
+      client.fail("deploy ${deployArgs}")
+      elapsed = time.time() - start
+      assert elapsed < ${toString expectCancellationWithin}, f"deploy took {elapsed}s, expected cancellation within ${toString expectCancellationWithin}s"
+      '' else ''
       # Make sure the hello and figlet packages are missing
       server.fail("su ${user} -l -c 'hello | figlet'")
 
@@ -120,6 +131,7 @@ let
 
       # Make sure packages are present after deployment
       server.succeed("su ${user} -l -c 'hello | figlet' >&2")
+      ''}
     '';
   };
 in {
@@ -172,6 +184,13 @@ in {
     name = "non-flake-with-flakes";
     flakes = true;
     deployArgs = "--file . --targets server";
+  };
+  # Verify activation failure triggers cancellation of the wait process,
+  # rather than waiting for the full activation timeout (default 240s).
+  activation-failure-cancellation = mkTest {
+    name = "activation-failure-cancellation";
+    deployArgs = "-s .#failing-server -- --offline";
+    expectCancellationWithin = 90;
   };
   # Pure-evaluation test for the drvPath auto-extraction. Runs without a VM.
   transform-deploy = import ./transform-deploy.nix { inherit pkgs; };
