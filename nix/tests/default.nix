@@ -119,9 +119,11 @@ let
       # rather than blocking until activation_timeout, so deploy returns quickly.
       import time
       start = time.time()
-      client.fail("deploy ${deployArgs}")
+      out = client.fail("deploy ${deployArgs} 2>&1")
       elapsed = time.time() - start
       assert elapsed < ${toString expectCancellationWithin}, f"deploy took {elapsed}s, expected cancellation within ${toString expectCancellationWithin}s"
+      # Fail on the activation error, not on some other error that happens to be quick.
+      assert "intentional activation failure" in out, f"deploy failed for an unexpected reason: {out}"
       '' else ''
       # Make sure the hello and figlet packages are missing
       server.fail("su ${user} -l -c 'hello | figlet'")
@@ -186,11 +188,11 @@ in {
     deployArgs = "--file . --targets server";
   };
   # Verify activation failure triggers cancellation of the wait process,
-  # rather than waiting for the full activation timeout (default 240s).
+  # rather than waiting for the full activation timeout.
   activation-failure-cancellation = mkTest {
     name = "activation-failure-cancellation";
-    deployArgs = "-s .#failing-server -- --offline";
-    expectCancellationWithin = 90;
+    deployArgs = "-s .#failing-server --activation-timeout 60 -- --offline";
+    expectCancellationWithin = 30;
   };
   # Pure-evaluation test for the drvPath auto-extraction. Runs without a VM.
   transform-deploy = import ./transform-deploy.nix { inherit pkgs; };
